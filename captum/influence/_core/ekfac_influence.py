@@ -52,46 +52,15 @@ class EKFACInfluence(DataInfluence):
 
         influences: Dict[str, Any] = {}
 
-        layer_AVDatasets = AV.generate_dataset_activations(
-            self.activation_dir,
-            self.module,
-            self.model_id,
-            self.layers,
-            DataLoader(self.influence_src_dataset, batch_size=self.batch_size, shuffle=False),
-            identifier="src",
-            load_from_disk=load_src_from_disk,
-            return_activations=True,
-        )
-
-        assert layer_AVDatasets is not None and not isinstance(
-            layer_AVDatasets, AV.AVDataset
-        )
-
-        layer_modules = [
-            common._get_module_from_name(self.module, layer) for layer in self.layers
-        ]
-
-        for i, (layer, layer_AVDataset) in enumerate(
-            zip(self.layers, layer_AVDatasets)
-        ):
-            
-            
+        self._compute_EKFAC_GNH()
 
     def _compute_EKFAC_GNH(self ):
+        ekfac = EKFACDistilled(self.module, 1e-5)
+        for i, (input, labels) in enumerate(self.influence_src_dataloader):
+            outputs = self.module(input)
+            # How to take the gradient of p(y|x)???
+            
 
-
-class AVGradDataset(AV.AVDataset):
-    def __init__(
-        self,
-        dataset: Dataset,
-        model: Module,
-        layer: str,
-        identifier: str,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(dataset, model, layer, identifier, **kwargs)
-        self._grads: Dict[int, Tensor] = {}
-        
 
 class EKFACDistilled(Optimizer):
     def __init__(self, net, eps):
@@ -126,7 +95,40 @@ class EKFACDistilled(Optimizer):
             self._compute_kfe(group, state)
 
             self._precond(weight, bias, group, state)
-    
+        for group in self.param_groups:
+            if len(group['params']) == 2:
+                weight, bias = group['params']
+            else:
+                weight = group['params'][0]
+                bias = None
+
+            state = self.state[weight]
+
+            mod = group['mod']
+            x = self.state[group['mod']]['x']
+            gy = self.state[group['mod']]['gy']
+
+            # Computation of activation cov matrix for batch
+            x = x.data.t()
+
+            # Append column of ones to x if bias is not None
+            if mod.bias is not None:
+                ones = torch.ones_like(x[:1])
+                x = torch.cat([x, ones], dim=0)
+            
+            # Calculate covariance matrix for activations (A_{l-1})
+            A = torch.mm(x, x.t()) / float(x.shape[1])
+
+            # Computation of psuedograd of layer output cov matrix for batch
+            gy = gy.data.t()
+
+            # Calculate covariance matrix for layer outputs (S_{l})
+            S = torch.mm(gy, gy.t()) / float(gy.shape[1])
+
+            # append to state
+            state['A'] = A
+            state['S'] = S
+
     def _compute_kfe(self, group, state):
         mod = group['mod']
         x = self.state[group['mod']]['x']
@@ -198,6 +200,13 @@ class EKFACDistilled(Optimizer):
         g_nat = g_nat.contiguous().view(*s)
         weight.grad.data = g_nat
 
+    def _save_input(self, mod, i):
+        """Saves input of layer to compute covariance."""
+        self.state[mod]['x'] = i[0]
+
+    def _save_grad_output(self, mod, grad_input, grad_output):
+        """Saves grad on output of layer to compute covariance."""
+        self.state[mod]['gy'] = grad_output[0] * grad_output[0].size(0)
 
         
 
