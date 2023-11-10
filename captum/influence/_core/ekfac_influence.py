@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from torch.optim.optimizer import Optimizer, params_t
+import torch.distributions as dist
 
 
 class EKFACInfluence(DataInfluence):
@@ -26,6 +27,23 @@ class EKFACInfluence(DataInfluence):
         batch_size: int = 1,
         **kwargs: Any,
     ) -> None:
+        r"""
+        Args:
+            module (Module): An instance of pytorch model. This model should define all of its
+                layers as attributes of the model. The output of the model must be logits for the
+                classification task.
+            layers (Union[str, List[str]]): A list of layer names for which the influence will
+                be computed.
+            influence_src_dataset (torch.utils.data.Dataset): Pytorch dataset that is used to create
+                a pytorch dataloader to iterate over the dataset. This is the dataset for which we will
+                be seeking for influential instances. In most cases this is the training dataset.
+            activation_dir (str): Path to the directory where the activation computations will be stored.
+            model_id (str): The name/version of the model for which layer activations are being computed.
+                Activations will be stored and loaded under the subdirectory with this name if provided.
+            batch_size (int): Batch size for the dataloader used to iterate over the influence_src_dataset.
+            **kwargs: Any additional arguments that are necessary for specific implementations of the
+                'DataInfluence' abstract class.
+        """
         self.module = module
         self.layers = [layers] if isinstance(layers, str) else layers
         self.influence_src_dataset = influence_src_dataset
@@ -54,12 +72,23 @@ class EKFACInfluence(DataInfluence):
 
         self._compute_EKFAC_GNH()
 
-    def _compute_EKFAC_GNH(self ):
+    def _compute_EKFAC_GNH(self, n_samples: int = 2):
         ekfac = EKFACDistilled(self.module, 1e-5)
-        for i, (input, labels) in enumerate(self.influence_src_dataloader):
+        loss_fn = torch.nn.CrossEntropyLoss()
+        for i, (input, _) in enumerate(self.influence_src_dataloader):
             outputs = self.module(input)
-            # How to take the gradient of p(y|x)???
-            
+            output_probs = torch.softmax(outputs, dim=-1)
+            distribution = dist.Categorical(output_probs)
+            for j in range(n_samples):
+                samples = distribution.sample()
+                loss = loss_fn(outputs, samples)
+                loss.backward()
+                ekfac.step()
+                self.module.zero_grad()
+        
+        for group in ekfac.param_groups:
+            alist = group['mod'].
+        
 
 
 class EKFACDistilled(Optimizer):
@@ -126,8 +155,8 @@ class EKFACDistilled(Optimizer):
             S = torch.mm(gy, gy.t()) / float(gy.shape[1])
 
             # append to state
-            state['A'] = A
-            state['S'] = S
+            state['A'].append(A)
+            state['S'].append(S)
 
     def _compute_kfe(self, group, state):
         mod = group['mod']
