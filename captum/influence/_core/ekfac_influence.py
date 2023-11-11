@@ -86,10 +86,23 @@ class EKFACInfluence(DataInfluence):
                 ekfac.step()
                 self.module.zero_grad()
         
+        # Compute average A and S
         for group in ekfac.param_groups:
-            alist = group['mod'].
+            A = torch.stack(group['A']).mean(dim=0)
+            S = torch.stack(group['S']).mean(dim=0)
         
+            # Compute eigenvalues and eigenvectors of A and S
+            la, Qa = torch.linalg.eigh(A, UPLO='U')
+            ls, Qs = torch.linalg.eigh(S, UPLO='U')
 
+            # Compute Kronecker product of eigenvalues and eigenvectors
+            eigenvec_kron = torch.kron(Qa, Qs)
+
+            eigenval_kron = torch.kron(torch.diag(la),torch.diag(ls))
+
+            # Compute GNH
+            G = torch.matmul(eigenvec_kron, torch.matmul(eigenval_kron, eigenvec_kron.t()))
+            
 
 class EKFACDistilled(Optimizer):
     def __init__(self, net, eps):
@@ -108,7 +121,7 @@ class EKFACDistilled(Optimizer):
                 params = [mod.weight]
                 if mod.bias is not None:
                     params.append(mod.bias)
-                d = {'params': params, 'mod': mod, 'layer_type': mod_class}
+                d = {'params': params, 'mod': mod, 'layer_type': mod_class, 'A': [], 'S': []}
                 self.params.append(d)
         super(EKFACDistilled, self).__init__(self.params, {})
 
@@ -124,6 +137,8 @@ class EKFACDistilled(Optimizer):
             self._compute_kfe(group, state)
 
             self._precond(weight, bias, group, state)
+
+    def calc_cov(self, calc_act: bool = True):
         for group in self.param_groups:
             if len(group['params']) == 2:
                 weight, bias = group['params']
@@ -145,8 +160,10 @@ class EKFACDistilled(Optimizer):
                 ones = torch.ones_like(x[:1])
                 x = torch.cat([x, ones], dim=0)
             
-            # Calculate covariance matrix for activations (A_{l-1})
-            A = torch.mm(x, x.t()) / float(x.shape[1])
+            if calc_act:
+                # Calculate covariance matrix for activations (A_{l-1})
+                A = torch.mm(x, x.t()) / float(x.shape[1])
+                group['A'].append(A)
 
             # Computation of psuedograd of layer output cov matrix for batch
             gy = gy.data.t()
@@ -154,9 +171,7 @@ class EKFACDistilled(Optimizer):
             # Calculate covariance matrix for layer outputs (S_{l})
             S = torch.mm(gy, gy.t()) / float(gy.shape[1])
 
-            # append to state
-            state['A'].append(A)
-            state['S'].append(S)
+            group['S'].append(S)
 
     def _compute_kfe(self, group, state):
         mod = group['mod']
