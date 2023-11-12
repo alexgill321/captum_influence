@@ -25,6 +25,7 @@ class EKFACInfluence(DataInfluence):
         activation_dir: str,
         model_id: str = "",
         batch_size: int = 1,
+        query_batch_size: int = 1,
         **kwargs: Any,
     ) -> None:
         r"""
@@ -50,6 +51,7 @@ class EKFACInfluence(DataInfluence):
         self.activation_dir = activation_dir
         self.model_id = model_id
         self.batch_size = batch_size
+        self.query_batch_size = query_batch_size
 
         self.influence_src_dataloader = DataLoader(
             self.influence_src_dataset, batch_size=batch_size, shuffle=False
@@ -57,7 +59,7 @@ class EKFACInfluence(DataInfluence):
     
     def influence(
             self,
-            inputs: Union[Tensor, Tuple[Tensor, ...]],
+            inputs: Dataset,
             topk: int = 1,
             additional_forward_args: Optional[Any] = None,
             load_src_from_disk: bool = True,
@@ -69,12 +71,64 @@ class EKFACInfluence(DataInfluence):
         )
 
         influences: Dict[str, Any] = {}
+        query_grads: Dict[str, List[Tensor]] = {}
+        influence_src_grads: Dict[str, List[Tensor]] = {}
 
-        self._compute_EKFAC_GNH()
+        query_dataloader = DataLoader(
+            inputs, batch_size=self.query_batch_size, shuffle=False
+        )
+
+        layer_modules = [
+            common._get_module_from_name(self.module, layer) for layer in self.layers
+        ]
+
+        G_list = self._compute_EKFAC_GNH()
+
+        for i, (queries, targets) in enumerate(query_dataloader):
+            criterion = torch.nn.CrossEntropyLoss()
+            self.module.zero_grad()
+            queries, targets = inputs
+            outputs = self.module(queries)
+            loss = criterion(outputs, targets.view(-1))
+            loss.backward()
+
+            for layer in layer_modules:
+                if layer.bias is not None:
+                    grad_bias = layer.bias.grad
+                    grad_weights = layer.weight.grad
+                    grads = torch.cat([grad_weights.view(-1), grad_bias.view(-1)], dim=1)
+                else:
+                    grads = layer.weight.grad.view(-1)
+                for grad in grads:
+                    query_grads[layer].append(grad)
+
+        for i, (inputs, targets) in enumerate(self.influence_src_dataloader):
+            self.module.zero_grad()
+            outputs = self.module(inputs)
+            loss = criterion(outputs, targets.view(-1))
+            loss.backward()
+
+            for layer in layer_modules:
+                if layer.bias is not None:
+                    grad_bias = layer.bias.grad
+                    grad_weights = layer.weight.grad
+                    grads = torch.cat([grad_weights.view(-1), grad_bias.view(-1)], dim=1)
+                else:
+                    grads = layer.weight.grad.view(-1)
+                for grad in grads:
+                    influence_src_grads[layer].append(grad)
+        
+        for layer in layer_modules:
+            query_grads[layer] = torch.stack(query_grads[layer])
+            influence_src_grads[layer] = torch.stack(influence_src_grads[layer])
+            influences[layer] = torch.matmul(influence_src_grads[layer], torch.matmul(G_list[layer], query_grads[layer]).t())
+
+        return influences
+            
 
     def _compute_EKFAC_GNH(self, n_samples: int = 2):
         ekfac = EKFACDistilled(self.module, 1e-5)
-        loss_fn = torch.nn.CrossEntropyLoss()
+        loss_fn = torch.nn.CrossEntropyLoss(reduction='sum')
         for i, (input, _) in enumerate(self.influence_src_dataloader):
             outputs = self.module(input)
             output_probs = torch.softmax(outputs, dim=-1)
@@ -86,6 +140,7 @@ class EKFACInfluence(DataInfluence):
                 ekfac.step()
                 self.module.zero_grad()
         
+        G_list = []
         # Compute average A and S
         for group in ekfac.param_groups:
             A = torch.stack(group['A']).mean(dim=0)
@@ -101,7 +156,9 @@ class EKFACInfluence(DataInfluence):
             eigenval_kron = torch.kron(torch.diag(la),torch.diag(ls))
 
             # Compute GNH
-            G = torch.matmul(eigenvec_kron, torch.matmul(eigenval_kron, eigenvec_kron.t()))
+            G_list.append(torch.matmul(eigenvec_kron, torch.matmul(eigenval_kron, eigenvec_kron.t())))
+            
+        return G_list
             
 
 class EKFACDistilled(Optimizer):
