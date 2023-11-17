@@ -1,10 +1,7 @@
-import warnings
-from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+from typing import Any, Dict, List, Union, Optional
+from torch.cuda.amp import autocast
 import captum._utils.common as common
 from captum.influence._core.influence import DataInfluence
-from captum._utils.av import AV
 from torch import Tensor
 from torch.nn import Module
 from torch.utils.data import Dataset, DataLoader
@@ -12,8 +9,9 @@ from torch.utils.data import Dataset, DataLoader
 import torch
 import torch.nn.functional as F
 
-from torch.optim.optimizer import Optimizer, params_t
+from torch.optim.optimizer import Optimizer
 import torch.distributions as dist
+import tqdm
 
 
 class EKFACInfluence(DataInfluence):
@@ -22,10 +20,9 @@ class EKFACInfluence(DataInfluence):
         module: Module,
         layers: Union[str, List[str]],
         influence_src_dataset: Dataset,
-        activation_dir: str,
         model_id: str = "",
-        batch_size: int = 1,
-        query_batch_size: int = 1,
+        batch_size: int = None,
+        cov_batch_size: int = None,
         **kwargs: Any,
     ) -> None:
         r"""
@@ -42,132 +39,200 @@ class EKFACInfluence(DataInfluence):
             model_id (str): The name/version of the model for which layer activations are being computed.
                 Activations will be stored and loaded under the subdirectory with this name if provided.
             batch_size (int): Batch size for the dataloader used to iterate over the influence_src_dataset.
+            query_batch_size (int): Batch size for the dataloader used to iterate over the query dataset.
+            cov_batch_size (int): Batch size for the dataloader used to compute the activations.
             **kwargs: Any additional arguments that are necessary for specific implementations of the
                 'DataInfluence' abstract class.
         """
-        self.module = module
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.module = module.to(self.device)
         self.layers = [layers] if isinstance(layers, str) else layers
         self.influence_src_dataset = influence_src_dataset
-        self.activation_dir = activation_dir
         self.model_id = model_id
-        self.batch_size = batch_size
-        self.query_batch_size = query_batch_size
 
         self.influence_src_dataloader = DataLoader(
             self.influence_src_dataset, batch_size=batch_size, shuffle=False
         )
+        self.cov_src_dataloader = DataLoader(
+            self.influence_src_dataset, batch_size=cov_batch_size, shuffle=False
+        )
     
     def influence(
             self,
-            inputs: Dataset,
+            query_dataset: Dataset,
             topk: int = 1,
-            additional_forward_args: Optional[Any] = None,
+            additional_forward_args: Optional[Any]= None,
+            eps: float = 1e-5,
             load_src_from_disk: bool = True,
             **kwargs: Any,
         ) -> Dict:
-
-        inputs_batch_size = (
-            inputs[0].shape[0] if isinstance(inputs, tuple) else inputs.shape[0]
-        )
 
         influences: Dict[str, Any] = {}
         query_grads: Dict[str, List[Tensor]] = {}
         influence_src_grads: Dict[str, List[Tensor]] = {}
 
         query_dataloader = DataLoader(
-            inputs, batch_size=self.query_batch_size, shuffle=False
+            query_dataset, batch_size=1, shuffle=False
         )
 
         layer_modules = [
             common._get_module_from_name(self.module, layer) for layer in self.layers
         ]
 
-        G_list = self._compute_EKFAC_GNH()
+        G_list = self._compute_EKFAC_params()
 
-        for i, (queries, targets) in enumerate(query_dataloader):
-            criterion = torch.nn.CrossEntropyLoss()
+        criterion = torch.nn.NLLLoss()
+        print(f'Cacultating query gradients on trained model')
+        for layer in layer_modules:
+            query_grads[layer] = []
+            influence_src_grads[layer] = []
+
+        for _, (inputs, targets) in tqdm.tqdm(enumerate(query_dataloader), total=len(query_dataloader)):
             self.module.zero_grad()
-            queries, targets = inputs
-            outputs = self.module(queries)
+            inputs = inputs.to(self.device)
+            targets = targets.to(self.device)
+            outputs = self.module(inputs)
+
             loss = criterion(outputs, targets.view(-1))
             loss.backward()
 
             for layer in layer_modules:
+                Qa = G_list[layer]['Qa']
+                Qs = G_list[layer]['Qs']
+                eigenval_diag = G_list[layer]['lambda']
                 if layer.bias is not None:
                     grad_bias = layer.bias.grad
                     grad_weights = layer.weight.grad
-                    grads = torch.cat([grad_weights.view(-1), grad_bias.view(-1)], dim=1)
+                    grad_bias = grad_bias.reshape(-1, 1)
+                    grads = torch.cat((grad_weights, grad_bias), dim=1)
                 else:
-                    grads = layer.weight.grad.view(-1)
-                for grad in grads:
-                    query_grads[layer].append(grad)
+                    grads = layer.weight.grad
 
-        for i, (inputs, targets) in enumerate(self.influence_src_dataloader):
+                p1 = torch.matmul(Qs, torch.matmul(grads, torch.t(Qa)))
+                p2 = torch.reciprocal(eigenval_diag+eps).reshape(p1.shape[0], -1)
+                ihvp = torch.flatten(torch.matmul(torch.t(Qs), torch.matmul((p1/p2), Qa)))
+                query_grads[layer].append(ihvp)
+
+        criterion = torch.nn.CrossEntropyLoss(reduction='none')
+        print(f'Cacultating training src gradients on trained model')
+        for i, (inputs, targets) in tqdm.tqdm(enumerate(self.influence_src_dataloader), total=len(self.influence_src_dataloader)):
             self.module.zero_grad()
+            inputs = inputs.to(self.device)
+            targets = targets.to(self.device)
             outputs = self.module(inputs)
             loss = criterion(outputs, targets.view(-1))
-            loss.backward()
+            for single_loss in loss:
+                single_loss.backward(retain_graph=True)
 
+                for layer in layer_modules:
+                    if layer.bias is not None:
+                        grad_bias = layer.bias.grad
+                        grad_weights = layer.weight.grad
+                        grad_bias = grad_bias.reshape(-1, 1)
+                        grads = torch.cat([grad_weights, grad_bias], dim=1)
+                    else:
+                        grads = layer.weight.grad
+                    influence_src_grads[layer].append(torch.flatten(grads))
+
+            # Calculate influences by batch to save memory
             for layer in layer_modules:
-                if layer.bias is not None:
-                    grad_bias = layer.bias.grad
-                    grad_weights = layer.weight.grad
-                    grads = torch.cat([grad_weights.view(-1), grad_bias.view(-1)], dim=1)
+                query_grad_matrix = torch.stack(query_grads[layer], dim=0)
+                influence_src_grad_matrix = torch.stack(influence_src_grads[layer], dim=0)
+                tinf = torch.matmul(query_grad_matrix, torch.t(influence_src_grad_matrix))
+                tinf = tinf.detach().cpu()
+                if layer not in influences:
+                    influences[layer] = tinf
                 else:
-                    grads = layer.weight.grad.view(-1)
-                for grad in grads:
-                    influence_src_grads[layer].append(grad)
-        
-        for layer in layer_modules:
-            query_grads[layer] = torch.stack(query_grads[layer])
-            influence_src_grads[layer] = torch.stack(influence_src_grads[layer])
-            influences[layer] = torch.matmul(influence_src_grads[layer], torch.matmul(G_list[layer], query_grads[layer]).t())
-
+                    influences[layer] = torch.cat((influences[layer], tinf), dim=1)
+                influence_src_grads[layer] = []
+                
         return influences
             
 
-    def _compute_EKFAC_GNH(self, n_samples: int = 2):
-        ekfac = EKFACDistilled(self.module, 1e-5)
+    def _compute_EKFAC_params(self, n_samples: int = 2):
+        ekfac = EKFAC(self.module, 1e-5)
         loss_fn = torch.nn.CrossEntropyLoss(reduction='sum')
-        for i, (input, _) in enumerate(self.influence_src_dataloader):
+        for _, (input, _) in tqdm.tqdm(enumerate(self.cov_src_dataloader), total=len(self.cov_src_dataloader)):
+            input = input.to(self.device)
             outputs = self.module(input)
             output_probs = torch.softmax(outputs, dim=-1)
             distribution = dist.Categorical(output_probs)
-            for j in range(n_samples):
+            for _ in range(n_samples):
                 samples = distribution.sample()
                 loss = loss_fn(outputs, samples)
-                loss.backward()
+                loss.backward(retain_graph=True)
                 ekfac.step()
                 self.module.zero_grad()
+                ekfac.zero_grad()
         
-        G_list = []
+        G_list = {}
         # Compute average A and S
         for group in ekfac.param_groups:
-            A = torch.stack(group['A']).mean(dim=0)
-            S = torch.stack(group['S']).mean(dim=0)
-        
-            # Compute eigenvalues and eigenvectors of A and S
-            la, Qa = torch.linalg.eigh(A, UPLO='U')
-            ls, Qs = torch.linalg.eigh(S, UPLO='U')
+            G_list[group['mod']] = {}
+            with autocast():
+                A = torch.stack(group['A']).mean(dim=0)
+                S = torch.stack(group['S']).mean(dim=0)
 
-            # Compute Kronecker product of eigenvalues and eigenvectors
-            eigenvec_kron = torch.kron(Qa, Qs)
+                print(f'Activation cov matrix shape {A.shape}')
+                print(f'Layer output cov matrix shape {S.shape}')
+            
+                # Compute eigenvalues and eigenvectors of A and S
+                la, Qa = torch.linalg.eigh(A)
+                ls, Qs = torch.linalg.eigh(S)
+                eigenval_diags = torch.outer(la, ls).flatten(start_dim=0)
 
-            eigenval_kron = torch.kron(torch.diag(la),torch.diag(ls))
-
-            # Compute GNH
-            G_list.append(torch.matmul(eigenvec_kron, torch.matmul(eigenval_kron, eigenvec_kron.t())))
+            G_list[group['mod']]['Qa'] = Qa
+            G_list[group['mod']]['Qs'] = Qs
+            G_list[group['mod']]['lambda'] = eigenval_diags
             
         return G_list
-            
+    
+def generate_dataset_influence_src_grads(
+        path: str,
+        model: Module,
+        identifier: Optional[str] = None,
+        layer: Optional[str] = None,
+        num_id: Optional[str] = None,
 
-class EKFACDistilled(Optimizer):
+    ) -> Optional[Union[ISGDataset, List[ISGDataset]]]:
+    r"""
+    Generates the gradients of the training dataset with respect to the model
+    """
+
+class ISGDataset(Dataset):
+    def __init__(
+            self, 
+            path: str,
+            model_id: str, 
+            layer: Optional[str] = None, 
+            identifier: Optional[str] = None, 
+            num_id: Optional[str] = None,
+        ) -> None:
+        r"""
+        Loads into memory the gradients of the training dataset asscociated with the input
+        'model_id' and 'layer' if provided.
+
+        Args:
+            path(str): Path to the directory where the gradients are stored.
+            model_id(str): The name/version of the model for which gradients
+              are being computed and stored.
+            identifier(str or None): An optional identifier for the layer activations.
+            Can be used to distinguish between different training batches.
+            layer (str or None): The name of the layer for which gradients are computed.
+            num_id(str or None): An optional string representing the batch number for
+                which gradients are computed.
+        """
+        self.isg_filesearch = 
+
+class EKFAC(Optimizer):
     def __init__(self, net, eps):
         self.eps = eps
         self.params = []
         self._fwd_handles = []
         self._bwd_handles = []
         self.net = net
+        self.calc_act = True
+
         for mod in net.modules():
             mod_class = mod.__class__.__name__
             if mod_class in ['Linear']:
@@ -180,34 +245,13 @@ class EKFACDistilled(Optimizer):
                     params.append(mod.bias)
                 d = {'params': params, 'mod': mod, 'layer_type': mod_class, 'A': [], 'S': []}
                 self.params.append(d)
-        super(EKFACDistilled, self).__init__(self.params, {})
+        super(EKFAC, self).__init__(self.params, {})
 
     def step(self):
         for group in self.param_groups:
-            if len(group['params']) == 2:
-                weight, bias = group['params']
-            else:
-                weight = group['params'][0]
-                bias = None
-            state = self.state[weight]
-
-            self._compute_kfe(group, state)
-
-            self._precond(weight, bias, group, state)
-
-    def calc_cov(self, calc_act: bool = True):
-        for group in self.param_groups:
-            if len(group['params']) == 2:
-                weight, bias = group['params']
-            else:
-                weight = group['params'][0]
-                bias = None
-
-            state = self.state[weight]
-
             mod = group['mod']
-            x = self.state[group['mod']]['x']
-            gy = self.state[group['mod']]['gy']
+            x = self.state[mod]['x']
+            gy = self.state[mod]['gy']
 
             # Computation of activation cov matrix for batch
             x = x.data.t()
@@ -217,89 +261,15 @@ class EKFACDistilled(Optimizer):
                 ones = torch.ones_like(x[:1])
                 x = torch.cat([x, ones], dim=0)
             
-            if calc_act:
+            if self.calc_act:
                 # Calculate covariance matrix for activations (A_{l-1})
-                A = torch.mm(x, x.t()) / float(x.shape[1])
-                group['A'].append(A)
+                group['A'].append(torch.mm(x, x.t()) / float(x.shape[1]))
 
             # Computation of psuedograd of layer output cov matrix for batch
             gy = gy.data.t()
 
             # Calculate covariance matrix for layer outputs (S_{l})
-            S = torch.mm(gy, gy.t()) / float(gy.shape[1])
-
-            group['S'].append(S)
-
-    def _compute_kfe(self, group, state):
-        mod = group['mod']
-        x = self.state[group['mod']]['x']
-        gy = self.state[group['mod']]['gy']
-        
-        # Computation of xxt
-        x = x.data.t() # transpose of activations
-
-        # Append column of ones to x if bias is not None
-        if mod.bias is not None:
-            ones = torch.ones_like(x[:1])
-            x = torch.cat([x, ones], dim=0)
-
-        # Calculate covariance matrix for activations (A_{l-1})
-        xxt = torch.mm(x, x.t()) / float(x.shape[1])
-
-        # Calculate eigenvalues and eigenvectors of covariance matrix (lambdaA, QA)
-        la, state['Qa'] = torch.linalg.eigh(xxt, UPLO='U')
-
-        # Computation of ggt
-        gy = gy.data.t()
-
-        # Calculate covariance matrix for layer outputs (S_{l})
-        ggt = torch.mm(gy, gy.t()) / float(gy.shape[1])
-
-        # Calculate eigenvalues and eigenvectors of covariance matrix (lambdaS, QS)
-        ls, state['Qs'] = torch.linalg.eigh(ggt, UPLO='U')
-
-        # Outer product of the eigenvalue vectors. Of shape (len(s) x len(a))
-        state['m2'] = ls.unsqueeze(1) * la.unsqueeze(0)
-
-    def _precond(self, weight, bias, group, state):
-        """Applies preconditioning."""
-        Qa = state['Qa']
-        Qs = state['Qs']
-        m2 = state['m2']
-        x = self.state[group['mod']]['x']
-        gy = self.state[group['mod']]['gy']
-        g = weight.grad.data
-        s = g.shape
-        s_x = x.size()
-        s_gy = gy.size()
-        bs = x.size(0)
-
-        # Append column of ones to x if bias is not None
-        if bias is not None:
-            ones = torch.ones_like(x[:,:1])
-            x = torch.cat([x, ones], dim=1)
-        
-        # KFE of activations ??
-        x_kfe = torch.mm(x, Qa)
-
-        # KFE of layer outputs ??
-        gy_kfe = torch.mm(gy, Qs)
-
-        m2 = torch.mm(gy_kfe.t()**2, x_kfe**2) / bs
-
-        g_kfe = torch.mm(gy_kfe.t(), x_kfe) / bs
-
-        g_nat_kfe = g_kfe / (m2 + self.eps)
-
-        g_nat = torch.mm(g_nat_kfe, Qs.t())
-
-        if bias is not None:
-            gb = g_nat[:, -1].contiguous().view(*bias.shape)
-            bias.grad.data = gb
-            g_nat = g_nat[:, :-1]
-        
-        g_nat = g_nat.contiguous().view(*s)
-        weight.grad.data = g_nat
+            group['S'].append(torch.mm(gy, gy.t()) / float(gy.shape[1]))
 
     def _save_input(self, mod, i):
         """Saves input of layer to compute covariance."""
@@ -308,7 +278,6 @@ class EKFACDistilled(Optimizer):
     def _save_grad_output(self, mod, grad_input, grad_output):
         """Saves grad on output of layer to compute covariance."""
         self.state[mod]['gy'] = grad_output[0] * grad_output[0].size(0)
-
         
 
 
