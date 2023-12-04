@@ -114,3 +114,7 @@ website/static/_sphinx/
 # Insight
 captum/insights/attr_vis/frontend/node_modules/
 captum/insights/attr_vis/widget/static
+
+#cav activations
+tutorials/cav/av
+*.vscode
