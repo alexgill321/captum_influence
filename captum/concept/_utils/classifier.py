@@ -177,8 +177,9 @@ class DefaultClassifier(Classifier):
         self.lm.fit(DataLoader(TensorDataset(x_train, y_train)))
 
         predict = self.lm(x_test)
-
-        predict = self.lm.classes()[torch.argmax(predict, dim=1)]  # type: ignore
+        pred_ind = torch.argmax(predict, dim=1)
+        pred_ind = pred_ind.cpu()
+        predict = self.lm.classes()[pred_ind]  # type: ignore
         score = predict.long() == y_test.long().cpu()
 
         accs = score.float().mean()
