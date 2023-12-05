@@ -118,3 +118,4 @@ captum/insights/attr_vis/widget/static
 #cav activations
 tutorials/cav/av
 *.vscode
+cav

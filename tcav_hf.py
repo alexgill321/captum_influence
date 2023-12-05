@@ -33,9 +33,8 @@ class CustomTextDataset(IterableDataset):
         def __iter__(self):
             for _, row in self.df.iterrows():
                 tokenized_text = self.tokenizer(row['text'], padding='max_length', truncation=True, max_length=self.max_len, return_tensors="pt")
-                text = self.tokenizer.decode(tokenized_text['input_ids'][0], skip_special_tokens=True)
-
-                yield text
+                ret_tensor = tokenized_text['input_ids'].to(self.device)
+                yield ret_tensor.squeeze(0)
 
 # %%
 def format_float(f):
@@ -85,10 +84,12 @@ class CaptumPipeline(TextClassificationPipeline):
 class TCAVTransformerPipeline():
     "Wrapper for Captum TCAV framework usage with Huggingface Pipeline"
 
-    def __init__(self, name:str, model: AutoModelForSequenceClassification, device: str):
+    def __init__(self, name: str, model: AutoModelForSequenceClassification, tokenizer: AutoTokenizer, device: str):
         self.__name = name
         self.__model = model
+        self.__tokenizer = tokenizer
         self.__device = device
+        self.max_len = 32
         
 
     def forward_func(self, inputs: tensor, position = 0):
@@ -105,11 +106,11 @@ class TCAVTransformerPipeline():
 
         inputs = self.generate_inputs(text)
 
-        prediction = self.model(inputs)
+        prediction = self.__model(inputs)
         
         # Tried initializing with model and forward_func, forward func doesn't work because direct access to model
         #layers is required. Model does not return logits.
-        tcav = TCAV(self.__pipeline, layers=['deberta.encoder.layer.0'])
+        tcav = TCAV(self.__model, layers=['deberta.encoder.layer.0'])
 
         t = torch.argmax(prediction[0])
 
@@ -118,12 +119,16 @@ class TCAVTransformerPipeline():
                                             inputs,
                                             experimental_sets=concept_sets,
                                             target=t
-                                            )
+                                        )
         
-        self.plot_tcav_scores(concept_sets, positive_interpretations, out_file=out_file, layers = ['deberta.encoder.layer'])
+        self.plot_tcav_scores(concept_sets, 
+                              positive_interpretations, 
+                              out_file=out_file, 
+                              layers = ['deberta.encoder.layer']
+                            )
 
 
-    def plot_tcav_scores(experimental_sets, tcav_scores, out_file, layers = ['convs.2'], score_type='sign_count'):
+    def plot_tcav_scores(self, experimental_sets, tcav_scores, out_file, layers = ['convs.2'], score_type='sign_count'):
         fig, ax = plt.subplots(1, len(experimental_sets), figsize = (25, 7))
 
         barWidth = 1 / (len(experimental_sets[0]) + 1)
@@ -148,6 +153,9 @@ class TCAVTransformerPipeline():
 
             # Create legend & Show graphic
             _ax.legend(fontsize=16)
+        
+        if not os.path.exists(os.path.dirname(out_file)):
+            os.makedirs(os.path.dirname(out_file))
         plt.savefig(out_file)
         
 
@@ -155,13 +163,8 @@ class TCAVTransformerPipeline():
         """
             Convenience method for generation of input ids as list of torch tensors
         """
-        return torch.tensor(self.__pipeline.tokenizer.encode(text, add_special_tokens=False), device = self.__device).unsqueeze(0)
-
-# %%
-class CustomModel(AutoModelForSequenceClassification):
-    def forward(self, *args, **kwargs):
-        outputs = super().forward(*args, **kwargs)
-        return outputs.logits
+        tok_text = self.__tokenizer(text, padding='max_length', truncation=True, max_length=self.max_len, return_tensors="pt").to(self.__device)
+        return tok_text['input_ids']
 
 # %%
 # parser = argparse.ArgumentParser()
@@ -194,8 +197,16 @@ positive_concept = assemble_concept('positive', 1, concepts_path=concept_dir +'/
 # %%
 concepts = [[positive_concept, neutral_concept]]
 
+#%%
+tokenized_inp = tokenizer("I love you", return_tensors="pt")
+tokenized_inp.to(device)
+model.to(device)
+model.eval()
+outputs = model(**tokenized_inp)
+print(outputs.logits)
+
 # %%
-tcav_model = TCAVTransformerPipeline(name='tcav', model=model, device=device)
+tcav_model = TCAVTransformerPipeline(name='tcav', model=model, tokenizer=tokenizer, device=device)
 
 idx = 0
 with jsonlines.open(a1_analysis_file, 'r') as reader:
