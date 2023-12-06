@@ -20,7 +20,6 @@ import jsonlines
 
 import os
 import matplotlib.pyplot as plt
-import argparse
 
 # %%
 class CustomTextDataset(IterableDataset):
@@ -91,13 +90,6 @@ class TCAVTransformerPipeline():
         self.__device = device
         self.max_len = 32
         
-
-    def forward_func(self, inputs: tensor, position = 0):
-        """
-            Wrapper around prediction method of pipeline
-        """
-        return self.model(inputs)[0]
-    
     def apply_concept(self, text: str, concept_sets: list, out_file: str):
         """
             Main entry method. Passes text through series of transformations and through the model. 
