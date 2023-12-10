@@ -574,8 +574,6 @@ def _select_targets(output: Tensor, target: TargetType) -> Tensor:
     the target is [(x1, y1), (x2, y2), ...], the selected output
     will be in shape (Batch, Z, ...)
     """
-    output = output.logits if hasattr(output, "logits") else output
-    
     if target is None:
         return output
 

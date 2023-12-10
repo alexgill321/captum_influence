@@ -178,13 +178,14 @@ output_dir = os.getcwd() + '/tutorials/out/checkpoints/'
 # %%
 tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, num_labels=num_labels)
+model.register_forward_hook(lambda self, input, output: output.logits)
 
 # %%
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 #creating concepts, this code is functional
-neutral_concept = assemble_concept('neutral', 0, concepts_path=concept_dir + '/neutral_samples.csv', tokenizer=tokenizer, device=device)
-positive_concept = assemble_concept('positive', 1, concepts_path=concept_dir +'/positive_samples.csv', tokenizer=tokenizer, device=device)
+neutral_concept = assemble_concept('random_1', 0, concepts_path=concept_dir + '/neutral_samples.csv', tokenizer=tokenizer, device=device)
+positive_concept = assemble_concept('random_2', 1, concepts_path=concept_dir +'/positive_samples.csv', tokenizer=tokenizer, device=device)
 
 # %%
 concepts = [[positive_concept, neutral_concept]]
@@ -195,7 +196,7 @@ tokenized_inp.to(device)
 model.to(device)
 model.eval()
 outputs = model(**tokenized_inp)
-print(outputs.logits)
+print(outputs)
 
 # %%
 tcav_model = TCAVTransformerPipeline(name='tcav', model=model, tokenizer=tokenizer, device=device)

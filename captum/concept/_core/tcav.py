@@ -798,3 +798,397 @@ class TCAV(ConceptInterpreter):
                     magnitude_score[i, :], dim=0, index=new_ord
                 ),
             }
+
+
+class TCAVLM(ConceptInterpreter):
+    r"""
+    This class implements ConceptInterpreter abstract class using a modification on the
+    original Testing with Concept Activation Vectors (TCAV) approach.
+
+    TCAV scores for a given layer, a list of concepts and input example are computed
+    using the dot product between prediction's layer sensitivities for given input
+    examples and Concept Activation Vectors (CAVs) in that same layer. The TCAV scores 
+    are computed for each output token from the Language Model (LM), giving the influence
+    of each concept on each token.
+
+    CAVs are defined as vectors that are orthogonal to the classification boundary
+    hyperplane that separate given concepts in a given layer from each other.
+    For a given layer, CAVs are computed by training a classifier that uses the
+    layer activation vectors of the final token in a set of concept examples
+    as input examples and concept ids as corresponding input labels. Trained weights
+    of that classifier represent CAVs.
+
+    CAVs are represented as a learned weight matrix with the dimensionality C X F, where:
+    F represents the number of input features in the classifier.
+    C is the number of concepts used for the classification. Concept ids are used as labels
+    for concept examples during the training.
+
+    We can use any layer attribution algorithm to compute layer sensitivities of a model
+    prediction. For example, the gradients of an output prediction w.r.t. the outputs of
+    the layer. The CAVs and the Sensitivities (SENS) are used to compute the TCAV score:
+
+    0. TCAV = CAV • SENS, a dot product between those two vectors
+
+    The final TCAV score can be computed per input example by aggregating the TCAV scores
+    for each input concept based on the sign or magnitude of the tcav scores.
+
+    1. sign_count_score = | TCAV > 0 | / | TCAV |
+    2. magnitude_score = SUM(ABS(TCAV * (TCAV > 0))) / SUM(ABS(TCAV))
+
+    This can also be extended across all input examples by taking the mean of the scores
+    across all examples.
+    """
+
+    def __init__(
+        self,
+        model: Module,
+        layers: Union[str, List[str]],
+        model_id: str = "default_model_id",
+        classifier: Classifier = None,
+        layer_attr_method: LayerAttribution = None,
+        attribute_to_layer_input=False,
+        save_path: str = "./cav/",
+        **classifier_kwargs: Any,
+    ) -> None:
+        r"""
+        Args:
+
+        """
+
+        ConceptInterpreter.__init__(self, model)
+        self.layers = [layers] if isinstance(layers, str) else layers
+        self.model_id = model_id
+        self.concepts: Set[Concept] = set()
+        self.classifier = classifier
+        self.classifier_kwargs = classifier_kwargs
+        self.cavs: Dict[str, Dict[str, CAV]] = defaultdict(lambda: defaultdict())
+        if self.classifier is None:
+            self.classifier = DefaultClassifier()
+        if layer_attr_method is None:
+            self.layer_attr_method = cast(
+                LayerAttribution,
+                LayerGradientXActivation(  # type: ignore
+                    model, None, multiply_by_inputs=False
+                ),
+            )
+        else:
+            self.layer_attr_method = layer_attr_method
+        
+        assert model_id, (
+            "`model_id` cannot be None or empty. Consider giving `model_id` "
+            "a meaningful name or leave it unspecified. If model_id is unspecified we "
+            "will use `default_model_id` as its default value."
+        ) 
+
+        self.attribute_to_layer_input = attribute_to_layer_input
+        self.save_path = save_path
+
+        # Creates CAV save directory if it doesn't exist. It is created once in the
+        # constructor before generating the CAVs.
+        # It is assumed that `model_id` can be used as a valid directory name
+        # otherwise `create_cav_dir_if_missing` will raise an error
+        CAV.create_cav_dir_if_missing(self.save_path, model_id)
+
+    def generate_all_activations(self) -> None:
+        r"""
+        Computes layer activations for all concepts and layers that are
+        defined in `self.layers` and `self.concepts` instance variables.
+        """
+        for concept in self.concepts:
+            self.generate_activation(self.layers, concept)
+    
+    def generate_activation(self, layers: Union[str, List], concept: Concept) -> None:
+        r"""
+        Computes layer activations for the specified `concept` and the list of layer(s)
+        `layers`.
+
+        Args:
+            layers (str or list[str]): A list of layer names or a layer name that is used
+                    to compute layer activations for the specific `concept`.
+            concept (Concept): A single Concept object that provides access to concept
+                    examples using a data iterator.
+        """
+        layers = [layers] if isinstance(layers, str) else layers
+        layer_modules = [_get_module_from_name(self.model, layer) for layer in layers]
+
+        layer_act = LayerActivation(self.model, layer_modules)
+        assert concept.data_iter is not None, (
+            "Data iterator for concept id:",
+            "{} must be specified".format(concept.id),
+        )
+
+        for i, examples in enumerate(concept.data_iter):
+            activations = layer_act.attribute.__wrapped__(  # type: ignore
+                layer_act,
+                examples,
+                attribute_to_layer_input=self.attribute_to_layer_input,
+            )
+            for activation, layer_name in zip(activations, layers):
+                activation = torch.reshape(activation, (activation.shape[0], -1))
+                AV.save(
+                    self.save_path,
+                    self.model_id,
+                    concept.identifier,
+                    layer_name,
+                    activation.detach(),
+                    str(i),
+                )
+
+    def generate_activations(self, concept_layers: Dict[Concept, List[str]]) -> None:
+        r"""
+        Computes layer activations for the concepts and layers specified in
+        `concept_layers` dictionary.
+
+        Args:
+            concept_layers (dict[Concept, list[str]]): Dictionay that maps Concept objects
+                    to a list of layer names to generate the activations. Ex.:
+                    concept_layers = {"striped": ['inception4c', 'inception4d']}
+        """
+        for concept in concept_layers:
+            self.generate_activation(concept_layers[concept], concept)
+    
+    def load_cavs(
+            self, concepts: List[Concept]
+    ) -> Tuple[List[str], Dict[Concept, List[str]]]:
+        r"""
+        This function load CAVs as a dictionary of concept ids and layers. CAVs are stored
+        in a directory located under `self.save_path` path, in .pkl files with the format:
+        <self.save_path>/<concept_ids>-<layer_name>.pkl. Ex.: "/cavs/0-1-2-inception4c.pkl",
+        where 0, 1 and 2 are concept ids.
+
+        It returns a list of layers and a dictionary of concept-layers mapping for the
+        concepts and layer that require CAV computation through training. This can happen
+        if the CAVs aren't already pre-computed for a given list of concepts and layer.
+
+        Args:
+            concepts (list[Concept]): A list of Concept objects for which we want to load
+                    the CAV.
+
+        Returns:
+            layers (list[layer]): A list of layers for which some CAVs still need to be
+                    computed.
+            concept_layers (dict[concept, layer]): A dictionay of concept-layers mapping
+                    for which we need to perform CAV computation through training.
+        """
+        
+        concepts_key = concepts_to_str(concepts)
+
+        layers = []
+        concept_layers = defaultdict(list)
+
+        for layer in self.layers:
+            self.cavs[concepts_key][layer] = CAV.load(
+                self.save_path, self.model_id, concepts, layer
+            )
+
+            # If CAV aren't loaded
+            if (
+                    concepts_key not in self.cavs
+                    or layer not in self.cavs[concepts_key]
+                    or not self.cavs[concepts_key][layer]
+            ):
+
+                layers.append(layer)
+                # For all concepts in this experimental_set
+                for concept in concepts:
+                    # Collect not activated layers for this concept
+                    if not AV.exists(
+                            self.save_path, self.model_id, layer, concept.identifier
+                    ):
+                        concept_layers[concept].append(layer)
+        return layers, concept_layers
+    
+    def compute_cavs(
+        self,
+        experimental_sets: List[List[Concept]],
+        force_train: bool = False,
+        processes: int = None,
+    ):
+        r"""
+        This method computes CAVs for given `experiments_sets` and layers specified in
+        `self.layers` instance variable. Internally, it trains a classifier and creates
+        an instance of CAV class using the weights of the trained classifier for each
+        experimental set.
+        
+        It also allows to compute the CAVs in parallel using python's multiprocessing API
+        and the number of processes specified in the argument.
+        
+        Args:
+            experimental_sets (list[list[Concept]]): A list of lists of concept instances
+                    for which the cavs will be computed.
+            force_train (bool, optional): A flag that indicates whether to train the CAVs
+                    regardless of whether they are saved or not. Default: False
+            processes (int, optional): The number of processes to be created when running
+                    in multi-processing mode. If processes > 0 then CAV computation will
+                    be performed in parallel using multi-processing, otherwise it will be
+                    performed sequentially in a single process. Default: None
+                    
+        Returns:
+            cavs (dict) : A mapping of concept ids and layers to CAV objects. If CAVs for
+                    the concept_ids-layer pairs are present in the data storage they will
+                    be loaded into the memory, otherwise they will be computed using a
+                    training process and stored in the data storage that can be configured
+                    using `save_path` input argument.
+        """
+
+        # Update self.concepts with concepts
+        for concepts in experimental_sets:
+            self.concepts.update(concepts)
+
+        concept_ids = []
+        for concept in self.concepts:
+            assert concept.id not in concept_ids, (
+                "There is more than one instance "
+                "of a concept with id {} defined in experimental sets. Please, "
+                "make sure to reuse the same instance of concept".format(
+                    str(concept.id)
+                )
+            )
+            concept_ids.append(concept.id)
+
+        if force_train:
+            self.generate_all_activations()
+        
+        # List of layers per concept key (experimental_set item) to be trained
+        concept_key_to_layers = defaultdict(list)
+
+        for concepts in experimental_sets:
+            concepts_key = concepts_to_str(concepts)
+
+            # If not 'force_train', try to load a saved CAV
+            if not force_train:
+                layers, concept_layers = self.load_cavs(concepts)
+                concept_key_to_layers[concepts_key] = layers
+                # Generate activations for missing (concept, layers)
+                self.generate_activations(concept_layers)
+            else:
+                concept_key_to_layers[concepts_key] = self.layers
+        if processes is not None and processes > 1:
+            pool = multiprocessing.Pool(processes)
+            cavs_list = pool.starmap(
+                train_cav,
+                [
+                    (
+                        self.model_id,
+                        concepts,
+                        concept_key_to_layers[concepts_to_str(concepts)],
+                        self.classifier,
+                        self.save_path,
+                        self.classifier_kwargs,
+                    )
+                    for concepts in experimental_sets
+                ],
+            )
+
+            pool.close()
+            pool.join()
+        
+        else:
+            cavs_list = []
+            for concepts in experimental_sets:
+                cavs_list.append(
+                    train_cav(
+                        self.model_id,
+                        concepts,
+                        concept_key_to_layers[concepts_to_str(concepts)],
+                        cast(Classifier, self.classifier),
+                        self.save_path,
+                        self.classifier_kwargs,
+                    )
+                )
+        
+        # list[Dict[concept, Dict[layer, list]]] => Dict[concept, Dict[layer, list]]
+        for cavs in cavs_list:
+            for c_key in cavs:
+                self.cavs[c_key].update(cavs[c_key])
+        
+        return self.cavs
+    
+    @log_usage()
+    def interpret(
+        self,
+        inputs: TensorOrTupleOfTensorsGeneric,
+        experimental_sets: List[List[Concept]],
+        target: TargetType = None,
+        additional_forward_args: Any = None,
+        processes: int = None,
+        **kwargs: Any,
+    ) -> Dict[str, Dict[str, Dict[str, Tensor]]]:
+        r"""
+        This method computes magnitude and sign-based TCAV scores for each experimental sets
+        in `experimental_sets` list. TCAV scores are computed using a dot product between
+        layer attribution scores for specific predictions and CAV vectors.
+        
+        Args: 
+        
+            inputs (Tensor or tuple[Tensor, ...]): Inputs for which predictions are performed
+                    and attributions are computed. If model takes a single tensor as input,
+                    a single input tensor should be provided. If model takes multiple tensors
+                    as input, a tuple of the input tensors should be provided. It is assumed
+                    that for all given input tensors, dimension 0 corresponds to the number
+                    of examples (aka batch size), and if multiple input tensors are provided,
+                    the examples must be aligned appropriately.
+                    
+            experimental_sets (list[list[Concept]]): A list of list of Concept instances.
+
+            """
+        assert "attribute_to_layer_input" not in kwargs, (
+            "Please, set `attribute_to_layer_input` flag as a constructor argument to TCAV"
+            " class. In that case it will be applied consistently to both layer activation"
+            " and layer attribution methods."
+        )
+        self.compute_cavs(experimental_sets, processes=processes)
+
+        scores: Dict[str, Dict[str, Dict[str, Tensor]]] = defaultdict(
+            lambda: defaultdict()
+        )
+
+        # Retrieves the lengths of the experimental sets so that we can sort them by the
+        # length and compute TCAV scores in batches.
+        exp_set_lens = np.array(
+            list(map(lambda exp_set: len(exp_set), experimental_sets)), dtype=object
+        )
+        exp_set_lens_arg_sort = np.argsort(exp_set_lens)
+
+        # compute offsets using sorted lengths using their indices
+        exp_set_lens_sort = exp_set_lens[exp_set_lens_arg_sort]
+        exp_set_offsets_bool = [False] + list(
+            exp_set_lens_sort[:-1] == exp_set_lens_sort[1:]
+        )
+        exp_set_offsets = []
+        for i, offset in enumerate(exp_set_offsets_bool):
+            if not offset:
+                exp_set_offsets.append(i)
+        
+        exp_set_offsets.append(len(exp_set_lens))
+
+        # sort experimental sets using the length of the concepts in each set
+        experimental_sets_sorted = np.array(experimental_sets, dtype=object)[
+            exp_set_lens_arg_sort
+        ]
+
+        for layer in self.layers:
+            layer_module = _get_module_from_name(self.model, layer)
+            self.layer_attr_method.layer = layer_module
+            attribs = self.layer_attr_method.attribute.__wrapped__(  # type: ignore
+                self.layer_attr_method,  # self
+                inputs,
+                # TODO: change target to the the argmax of the outputs.
+                target=target,
+                additional_forward_args=additional_forward_args,
+                attribute_to_layer_input=self.attribute_to_layer_input,
+                **kwargs,
+            )
+
+            attribs = _format_tensor_into_tuples(attribs)
+            # n_inputs x n_features
+            attribs = torch.cat(
+                [torch.reshape(attrib, (attrib.shape[0], -1)) for attrib in attribs],
+                dim=1,
+            )
+
+            # n_experiments x n_concepts x n_features
+            cavs = []
+            classes = []
+
+

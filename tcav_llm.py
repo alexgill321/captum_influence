@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset, IterableDataset, Subset
 from datasets import load_dataset
 
 # %%
-from captum.concept import TCAV
+from captum.concept import TCAVLM
 from captum.concept import Concept
 from captum.concept._utils.common import concepts_to_str
 import jsonlines
@@ -92,17 +92,29 @@ concept_data_2 = tokenized_data.take(100)
 model.to(device)
 for i, example in enumerate(concept_data_1):
     tokens = model(example['input_ids'])
-    print(i)
+    print(tokens.logits.shape)
     if i > 2:
         break  
 
+# %%
+
+# %% Retrieve the output for the last token in the ouput sequence
+concept_hook = model.register_forward_hook(lambda self, input, output: output.logits[:, -1, :])
 for i, example in enumerate(concept_data_2):
     tokens = model(example['input_ids'])
-    print(i)
+    print(tokens.shape)
     if i > 2:
         break
 
-    
+concept_hook.remove()
+
+# %%
+model.to(device)
+for i, example in enumerate(concept_data_1):
+    tokens = model(example['input_ids'])
+    print(tokens.logits.shape)
+    if i > 2:
+        break  
 # Generate new datasets using the tokenized data?
 # %% Create Concepts
 concept_loader_1 = DataLoader(concept_data_1, batch_size=1)
@@ -114,8 +126,16 @@ concepts = [random_concept_1, random_concept_2]
 #%%
 for name, param in model.named_parameters():
     print(name)
-#%% Run TCAV
+#%% Generate Queries and Labels
 tokenized_dataset = tokenized_data.skip(100)
 input_dataset = tokenized_dataset.take(10)
 
-tcav = TCAV(model, layers=["gpt_neox.layers.1.mlp.dense_h_to_4h"])
+tcav = TCAVLM(model, layers=["gpt_neox.layers.1.mlp.dense_h_to_4h"])
+
+#%%
+for example in input_dataset:
+    tcav.interpret(
+        example["input_ids"],
+        concepts,
+        
+    )
