@@ -196,7 +196,7 @@ tokenized_inp.to(device)
 model.to(device)
 model.eval()
 outputs = model(**tokenized_inp)
-print(outputs)
+print(outputs.logits)
 
 # %%
 tcav_model = TCAVTransformerPipeline(name='tcav', model=model, tokenizer=tokenizer, device=device)

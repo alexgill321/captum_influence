@@ -20,6 +20,7 @@ import jsonlines
 
 import os
 import matplotlib.pyplot as plt
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 #%%
 model_checkpoint = "distilbert-base-uncased-finetuned-sst-2-english"
@@ -27,10 +28,11 @@ model_checkpoint = "distilbert-base-uncased-finetuned-sst-2-english"
 # %%
 tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-160m")
 model = GPTNeoXForCausalLM.from_pretrained("EleutherAI/pythia-160m")
+model.to(device)
 
 # %%
 
-inputs = tokenizer("Hello, I am", return_tensors="pt")
+inputs = tokenizer("Hello, I am", return_tensors="pt").to(device)
 tokens = model.generate(**inputs)
 tokenizer.decode(tokens[0])
 
@@ -43,7 +45,7 @@ print(model.config.max_position_embeddings)
 
 # %%
 for i, example in enumerate(dataset):
-    inputs = tokenizer.encode(example["text"], max_length=model.config.max_position_embeddings-200, return_tensors="pt")
+    inputs = tokenizer.encode(example["text"], max_length=model.config.max_position_embeddings-200, return_tensors="pt").to(device)
     tokens = model(inputs)
     print(tokens.logits.shape)
     for j in range(tokens.logits.shape[1]):
@@ -51,16 +53,33 @@ for i, example in enumerate(dataset):
     break
 
 # %%
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
 def preprocess_function(examples):
-    return tokenizer(
+    tokenized_input = tokenizer(
                 examples["text"], 
                 truncation=True, 
                 max_length=model.config.max_position_embeddings, 
                 return_tensors="pt"
-            ).to(device)
+            )
+    input_ids = tokenized_input["input_ids"]
+    return input_ids.to(device)
 
-tokenized_data = dataset.map(preprocess_function)
+class PreprocessedDataset(IterableDataset):
+    def __init__(self, dataset, preprocess_function):
+        self.dataset = dataset
+        self.preprocess_function = preprocess_function
+
+    def __iter__(self):
+        for example in self.dataset:
+            yield self.preprocess_function(example)
+
+    def take(self, n):
+        return PreprocessedDataset(self.dataset.take(n), preprocess_function)
+
+    
+    def skip(self, n):
+        return PreprocessedDataset(self.dataset.skip(n), preprocess_function)
+
+tokenized_data = PreprocessedDataset(dataset, preprocess_function)
 
 # # %%
 # for i, example in enumerate(tokenized_data):
@@ -85,47 +104,44 @@ tokenized_data = dataset.map(preprocess_function)
 
 # %%
 concept_data_1 = tokenized_data.take(100)
-tokenized_data = tokenized_data.skip(100)
-concept_data_2 = tokenized_data.take(100)
+other_data = tokenized_data.skip(100)
+concept_data_2 = other_data.take(100)
 
-# %%
-model.to(device)
-for i, example in enumerate(concept_data_1):
-    tokens = model(example['input_ids'])
-    print(tokens.logits.shape)
-    if i > 2:
-        break  
+# # %%
+# model.to(device)
+# for i, example in enumerate(concept_data_1):
+#     tokens = model(example)
+#     print(tokens.logits.shape)
+#     if i > 2:
+#         break  
 
-# %%
+# # %% Retrieve the output for the last token in the ouput sequence
+# # concept_hook = model.register_forward_hook(lambda self, input, output: output.logits[:, -1, :])
+# concept_hook = model.register_forward_hook(lambda self, input, output: output.logits.squeeze(0).argmax(dim=-1, keepdim=False))
+# for i, example in enumerate(concept_data_2):
+#     tokens = model(example)
+#     print(tokens.shape)
+#     if i > 2:
+#         break
 
-# %% Retrieve the output for the last token in the ouput sequence
-concept_hook = model.register_forward_hook(lambda self, input, output: output.logits[:, -1, :])
-for i, example in enumerate(concept_data_2):
-    tokens = model(example['input_ids'])
-    print(tokens.shape)
-    if i > 2:
-        break
+# concept_hook.remove()
 
-concept_hook.remove()
-
-# %%
-model.to(device)
-for i, example in enumerate(concept_data_1):
-    tokens = model(example['input_ids'])
-    print(tokens.logits.shape)
-    if i > 2:
-        break  
+# # %%
+# model.to(device)
+# for i, example in enumerate(concept_data_1):
+#     tokens = model(example)
+#     print(tokens.logits.shape)
+#     if i > 2:
+#         break  
 # Generate new datasets using the tokenized data?
 # %% Create Concepts
-concept_loader_1 = DataLoader(concept_data_1, batch_size=1)
-concept_loader_2 = DataLoader(concept_data_2, batch_size=1)
-random_concept_1 = Concept(id=id, name="random_concept_1", data_iter=concept_loader_1)
-random_concept_2 = Concept(id=id, name="random_concept_2", data_iter=concept_loader_2)
+random_concept_1 = Concept(id=0, name="random_concept_1", data_iter=concept_data_1)
+random_concept_2 = Concept(id=1, name="random_concept_2", data_iter=concept_data_2)
 
-concepts = [random_concept_1, random_concept_2]
+concepts = [[random_concept_1, random_concept_2]]
 #%%
-for name, param in model.named_parameters():
-    print(name)
+for module in model.modules():
+    print(module)
 #%% Generate Queries and Labels
 tokenized_dataset = tokenized_data.skip(100)
 input_dataset = tokenized_dataset.take(10)
@@ -135,7 +151,7 @@ tcav = TCAVLM(model, layers=["gpt_neox.layers.1.mlp.dense_h_to_4h"])
 #%%
 for example in input_dataset:
     tcav.interpret(
-        example["input_ids"],
-        concepts,
-        
+        example,
+        concepts
     )
+# %%
