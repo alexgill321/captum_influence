@@ -1,5 +1,5 @@
 import tempfile
-from typing import Callable
+from typing import Callable, Union
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,7 @@ from tests.influence._utils.common import (
 class TestTracInGetKMostInfluential(BaseTest):
 
     use_gpu_list = (
-        [True, False]
+        [False, "cuda", "cuda_data_parallel"]
         if torch.cuda.is_available() and torch.cuda.device_count() != 0
         else [False]
     )
@@ -28,20 +28,31 @@ class TestTracInGetKMostInfluential(BaseTest):
         for unpack_inputs in [True, False]:
             for proponents in [True, False]:
                 for use_gpu in use_gpu_list:
-                    for reduction, constr in [
+                    for (reduction, constr, aggregate) in [
                         (
                             "none",
                             DataInfluenceConstructor(
                                 TracInCP, name="TracInCP_all_layers"
                             ),
+                            False,
+                        ),
+                        (
+                            "none",
+                            DataInfluenceConstructor(
+                                TracInCP, name="TracInCP_all_layers"
+                            ),
+                            True,
                         ),
                         (
                             "none",
                             DataInfluenceConstructor(
                                 TracInCP,
                                 name="linear2",
-                                layers=["module.linear2"] if use_gpu else ["linear2"],
+                                layers=["module.linear2"]
+                                if use_gpu == "cuda_data_parallel"
+                                else ["linear2"],
                             ),
+                            False,
                         ),
                     ]:
                         if not (
@@ -58,6 +69,7 @@ class TestTracInGetKMostInfluential(BaseTest):
                                     batch_size,
                                     k,
                                     use_gpu,
+                                    aggregate,
                                 )
                             )
 
@@ -73,7 +85,8 @@ class TestTracInGetKMostInfluential(BaseTest):
         proponents: bool,
         batch_size: int,
         k: int,
-        use_gpu: bool,
+        use_gpu: Union[bool, str],
+        aggregate: bool,
     ) -> None:
         """
         This test constructs a random BasicLinearNet, and checks that the proponents
@@ -110,12 +123,14 @@ class TestTracInGetKMostInfluential(BaseTest):
             train_scores = tracin.influence(
                 _format_batch_into_tuple(test_samples, test_labels, unpack_inputs),
                 k=None,
+                aggregate=aggregate,
             )
             sort_idx = torch.argsort(train_scores, dim=1, descending=proponents)[:, 0:k]
             idx, _train_scores = tracin.influence(
                 _format_batch_into_tuple(test_samples, test_labels, unpack_inputs),
                 k=k,
                 proponents=proponents,
+                aggregate=aggregate,
             )
             for i in range(len(idx)):
                 # check that idx[i] is correct
