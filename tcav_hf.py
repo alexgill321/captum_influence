@@ -184,8 +184,8 @@ model.register_forward_hook(lambda self, input, output: output.logits)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 #creating concepts, this code is functional
-neutral_concept = assemble_concept('random_1', 0, concepts_path=concept_dir + '/neutral_samples.csv', tokenizer=tokenizer, device=device)
-positive_concept = assemble_concept('random_2', 1, concepts_path=concept_dir +'/positive_samples.csv', tokenizer=tokenizer, device=device)
+neutral_concept = assemble_concept('neutral', 0, concepts_path=concept_dir + '/neutral_samples.csv', tokenizer=tokenizer, device=device)
+positive_concept = assemble_concept('positive', 1, concepts_path=concept_dir +'/positive_samples.csv', tokenizer=tokenizer, device=device)
 
 # %%
 concepts = [[positive_concept, neutral_concept]]
@@ -204,5 +204,6 @@ tcav_model = TCAVTransformerPipeline(name='tcav', model=model, tokenizer=tokeniz
 idx = 0
 with jsonlines.open(a1_analysis_file, 'r') as reader:
     for obj in reader:
+        print(obj["review"])
         tcav_model.apply_concept(obj["review"], concepts, os.path.join(output_dir, f'example_{idx}'))
 # %%

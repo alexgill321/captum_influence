@@ -1169,7 +1169,10 @@ class TCAVLM(ConceptInterpreter):
             exp_set_lens_arg_sort
         ]
 
-        attribute_hook = self.model.register_forward_hook(lambda self, input, output: output.logits.squeeze(0).max(dim=-1, keepdim=False))
+        output = self.model(inputs)
+        target = output.logits.squeeze(0).argmax(dim=-1, keepdim=False)[-1]
+
+        attribute_hook = self.model.register_forward_hook(lambda self, input, output: output.logits[:,-1,:])
         for layer in self.layers:
             layer_module = _get_module_from_name(self.model, layer)
             self.layer_attr_method.layer = layer_module
@@ -1177,11 +1180,12 @@ class TCAVLM(ConceptInterpreter):
                 self.layer_attr_method,  # self
                 #TODO Reshape input to match outputs as (batch size) so (len x )
                 inputs,
+                target=target,
                 additional_forward_args=additional_forward_args,
                 attribute_to_layer_input=self.attribute_to_layer_input,
                 **kwargs,
             )
-
+            attribute_hook.remove()
             attribs = _format_tensor_into_tuples(attribs)
             # n_inputs x n_features
             attribs = torch.cat(
@@ -1231,7 +1235,6 @@ class TCAVLM(ConceptInterpreter):
                     experimental_subset_sorted,
                 )
                 i += 1
-        attribute_hook.remove()
 
         return scores
     
